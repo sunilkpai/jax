@@ -127,7 +127,6 @@ Operators
     squeeze
     sub
     tan
-    tie_in
     top_k
     transpose
 

@@ -42,10 +42,10 @@ from .. import core
 from .. import dtypes
 from ..abstract_arrays import UnshapedArray, ShapedArray, ConcreteArray, canonicalize_shape
 from ..config import flags
-from ..interpreters.xla import (DeviceArray, device_put, array_result_handler,
-                                DeviceValue, abstractify)
+from ..interpreters.xla import DeviceArray, DeviceValue
 from ..interpreters.masking import Poly
 from .. import lax
+from ..lax.lax import _device_put_raw
 from .. import ops
 from ..util import (partial, unzip2, prod as _prod,
                     subvals, safe_zip)
@@ -1080,6 +1080,7 @@ def reshape(a, newshape, order="C"):
 def _compute_newshape(a, newshape):
   """Fixes a -1 value in newshape, if present."""
   # other errors, like having more than one -1, are caught downstream
+  newshape = list(map(int, newshape))
   newsize = _prod(newshape)
   if newsize < 0:
     fix = a.size // -newsize
@@ -2181,10 +2182,6 @@ def array(object, dtype=None, copy=True, order="K", ndmin=0):
 def _can_call_numpy_array(x):
   return _all(not isinstance(l, (core.Tracer, DeviceValue))
               for l in tree_leaves(x))
-
-# TODO(mattjj): maybe move these two functions into xla.py
-def _device_put_raw(x):
-  return array_result_handler(None, abstractify(x))(device_put(x))
 
 
 @_wraps(np.asarray)
@@ -3351,7 +3348,6 @@ def _take_along_axis(arr, indices, axis):
       j += 1
     elif idx_shape[i] != 1:
       iota = lax.iota(_dtype(indices), out_shape[i])
-      iota = lax.tie_in(arr, iota)
       iota = lax.broadcast_in_dim(iota, gather_index_shape, (j,))
       gather_indices.append(iota)
       slice_sizes.append(1)
@@ -3769,9 +3765,9 @@ def _expand_bool_indices(idx):
         abstract_i = core.get_aval(i)
 
       if not type(abstract_i) is ConcreteArray:
-        msg = ("Array boolean indices must be static (e.g. no dependence on an "
-               "argument to a jit or vmap function).")
-        raise IndexError(msg)
+        # TODO(mattjj): improve this error by tracking _why_ the indices are not
+        # concrete
+        raise IndexError("Array boolean indices must be concrete.")
       else:
         out.extend(np.where(i))
     else:

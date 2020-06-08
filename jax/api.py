@@ -47,7 +47,7 @@ from .tree_util import (tree_map, tree_flatten, tree_unflatten, tree_structure,
                         tree_transpose, tree_leaves, tree_multimap,
                         treedef_is_leaf)
 from .util import (unzip2, curry, partial, safe_map, safe_zip, prod,
-                   split_list, extend_name_stack, wrap_name)
+                   split_list, extend_name_stack, wrap_name, cache)
 from .lib import xla_bridge as xb
 from .lib import xla_client as xc
 # Unused imports to be exported
@@ -104,12 +104,13 @@ def jit(fun: Callable, static_argnums: Union[int, Iterable[int]] = (),
       why hash and equality operators must be defined.
     static_argnums: An int or collection of ints specifying which positional
       arguments to treat as static (compile-time constant). Operations that only
-      depend on static arguments will be constant-folded. Calling the jitted
-      function with different values for these constants will trigger
-      recompilation. If the jitted function is called with fewer positional
-      arguments than indicated by ``static_argnums`` then an error is raised.
-      Arguments that are not arrays or containers thereof must be marked as
-      static. Defaults to ().
+      depend on static arguments will be constant-folded in Python (during
+      tracing), and so the corrersponding argument values can be any Python
+      object. Calling the jitted function with different values for these
+      constants will trigger recompilation. If the jitted function is called
+      with fewer positional arguments than indicated by ``static_argnums`` then
+      an error is raised. Arguments that are not arrays or containers thereof
+      must be marked as static. Defaults to ().
     device: This is an experimental feature and the API is likely to change.
       Optional, the Device the jitted function will run on. (Available devices
       can be retrieved via :py:func:`jax.devices`.) The default is inherited from
@@ -228,7 +229,7 @@ def xla_computation(fun: Callable,
                     axis_env: Optional[Sequence[Tuple[AxisName, int]]] = None,
                     backend: Optional[str] = None,
                     tuple_args: bool = False,
-                    instantiate_const_outputs: bool = True) -> Callable:
+                    instantiate_const_outputs: Optional[bool] = None) -> Callable:
   """Creates a function that produces its XLA computation given example args.
 
   Args:
@@ -246,13 +247,6 @@ def xla_computation(fun: Callable,
     tuple_args: Optional bool, defaults to ``False``. If ``True``, the resulting
       XLA computation will have a single tuple argument that is unpacked into
       the specified function arguments.
-    instantiate_const_outputs: Optional bool, defaults to ``True``. If
-      ``False``, then :py:func:`xla_computation` does not instantiate
-      constant-valued outputs in the XLA computation, and so the result is
-      closer to the computation that :py:func:`jax.jit` produces and may be more
-      useful for studying :py:func:`jit` behavior. If ``True``, then
-      constant-valued outputs are instantiated in the XLA computation, which may
-      be more useful for staging computations out of JAX entirely.
 
   Returns:
     A wrapped version of ``fun`` that when applied to example arguments returns a
@@ -325,6 +319,11 @@ def xla_computation(fun: Callable,
     ROOT tuple.18 = (f32[], f32[], f32[]) tuple(all-reduce.7, all-reduce.12, all-reduce.17)
   }
   """
+  if instantiate_const_outputs is not None:
+    warn("the `instantiate_const_outputs` argument to `xla_computation` "
+         "is deprecated and no longer does anything.")
+  del instantiate_const_outputs  # Unused
+
   _check_callable(fun)
   if isinstance(static_argnums, int):
     static_argnums = (static_argnums,)
@@ -332,11 +331,11 @@ def xla_computation(fun: Callable,
 
   def make_axis_env(nreps):
     if axis_env is None:
-      return xla.AxisEnv(nreps)
+      return xla.AxisEnv(nreps, (), (), None)
     else:
       nreps = nreps * prod(size for name, size in axis_env)
       names, sizes = zip(*axis_env)
-      return xla.AxisEnv(nreps, names, sizes)
+      return xla.AxisEnv(nreps, names, sizes, None)
 
   def abstractify(x):
     return ShapedArray(onp.shape(x), dtypes.result_type(x))
@@ -350,10 +349,7 @@ def xla_computation(fun: Callable,
     jax_args, in_tree = tree_flatten((args, kwargs))
     jaxtree_fun, out_tree = flatten_fun(wrapped, in_tree)
     avals = map(abstractify, jax_args)
-    pvals = [pe.PartialVal.unknown(aval) for aval in avals]
-    jaxpr, _, consts = pe.trace_to_jaxpr(jaxtree_fun, pvals,
-                                         instantiate=instantiate_const_outputs,
-                                         stage_out=True)
+    jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(jaxtree_fun, avals)
     jaxpr = xla.apply_outfeed_rewriter(jaxpr)
     axis_env_ = make_axis_env(xla.jaxpr_replicas(jaxpr))
     c = xb.make_computation_builder('xla_computation_{}'.format(fun_name))
@@ -1179,8 +1175,8 @@ class _TempAxisName:
     return type(other) is _TempAxisName and self.obj == other.obj
 
 
-def soft_pmap(fun: Callable, axis_name: Optional[AxisName] = None, *,
-              in_axes=0, backend: Optional[str] = None) -> Callable:
+def soft_pmap(fun: Callable, axis_name: Optional[AxisName] = None, in_axes=0
+              ) -> Callable:
   warn("soft_pmap is an experimental feature and probably has bugs!")
   _check_callable(fun)
   axis_name = _TempAxisName(fun) if axis_name is None else axis_name
@@ -1197,44 +1193,10 @@ def soft_pmap(fun: Callable, axis_name: Optional[AxisName] = None, *,
     axis_size = _mapped_axis_size(in_tree, args_flat, in_axes_flat, "soft_pmap")
     for arg in args_flat: _check_arg(arg)
     flat_fun, out_tree = flatten_fun(f, in_tree)
-
-    chunk_size, leftover = divmod(axis_size, pxla.unmapped_device_count(backend))
-    if chunk_size == 0 and leftover:
-      return pmap(fun, axis_name, backend=backend)(*args)  # can map directly onto hardware
-    elif leftover:
-      msg = ("soft_pmap mapped axis size must be divisible by the number of "
-             "XLA devices (or be less than or equal to that number), but got "
-             "an axis size of {} with {} devices.")
-      raise ValueError(msg.format(axis_size, pxla.unmapped_device_count()))
-    num_chunks = axis_size // chunk_size
-
-    reshaped_args = [_reshape_split(num_chunks, x) for x in args_flat]
-    soft_mapped_fun = pxla.split_axis(flat_fun, axis_name, chunk_size)
-    # TODO(tomhennigan): soft_pmap should support buffer donation.
-    donated_invars = (False,) * len(reshaped_args)
-    reshaped_outs = pxla.xla_pmap(soft_mapped_fun, *reshaped_args, backend=backend,
-                                  axis_name=axis_name, axis_size=num_chunks,
-                                  global_axis_size=None, devices=None,
-                                  name=soft_mapped_fun.__name__,
-                                  mapped_invars=mapped_invars,
-                                  donated_invars=donated_invars)
-    outs = [_reshape_merge(out) for out in reshaped_outs]
+    outs = pxla.soft_pmap(flat_fun, *args_flat, axis_name=axis_name,
+                          axis_size=axis_size, mapped_invars=mapped_invars)
     return tree_unflatten(out_tree(), outs)
   return f_pmapped
-
-def _reshape_split(num_chunks, x):
-  aval = core.get_aval(x)
-  if aval is core.abstract_unit:
-    return x
-  else:
-    return x.reshape((num_chunks, x.shape[0] // num_chunks) + x.shape[1:])
-
-def _reshape_merge(x):
-  aval = core.get_aval(x)
-  if aval is core.abstract_unit:
-    return x
-  else:
-    return x.reshape((-1,) + x.shape[2:])
 
 
 def _papply(fun):
@@ -1251,37 +1213,6 @@ def _papply(fun):
     return tree_unflatten(out_tree(), out_flat)
 
   return papply_fun, axis_name
-
-
-def _parallelize(fun):
-  axis_name = _TempAxisName(fun)
-
-  def pfun(*args):
-    f = lu.wrap_init(fun)
-    args_flat, in_tree = tree_flatten(args)
-    f, out_tree = flatten_fun_nokwargs(f, in_tree)
-    axis_size = _mapped_axis_size(
-        in_tree, args_flat, (0,) * len(args_flat), "parallelize")
-
-    chunk_size, leftover = divmod(axis_size, pxla.unmapped_device_count())
-    if chunk_size == 0 and leftover:
-      return pmap(fun, axis_name)(*args)  # can map directly onto hardware
-    elif leftover:
-      raise ValueError
-    num_chunks = axis_size // chunk_size
-
-    reshaped_args = [_reshape_split(num_chunks, x) for x in args_flat]
-    f, out_axes = parallel.papply_transform(f, axis_name, axis_size)
-    f = pxla.split_axis(f, axis_name, chunk_size)
-    outs = pxla.xla_pmap(f, *reshaped_args, backend=None, axis_name=axis_name,
-                         axis_size=num_chunks, global_axis_size=None,
-                         devices=None, name=f.__name__)
-    outs = map(_reshape_merge, outs)
-    outs = [batching.matchaxis(axis_size, 0, dst, x)
-            for dst, x in zip(out_axes(), outs)]
-    return tree_unflatten(out_tree(), outs)
-
-  return pfun
 
 
 def mask(fun: Callable, in_shapes, out_shape) -> Callable:
@@ -1620,10 +1551,6 @@ def make_jaxpr(fun: Callable,
   if isinstance(static_argnums, int):
     static_argnums = (static_argnums,)
 
-  def pv_like(x):
-    aval = xla.abstractify(x)
-    return pe.PartialVal.unknown(aval)
-
   @wraps(fun)
   def jaxpr_maker(*args, **kwargs):
     wrapped = lu.wrap_init(fun)
@@ -1632,11 +1559,9 @@ def make_jaxpr(fun: Callable,
       wrapped, _ = argnums_partial(wrapped, dyn_argnums, args)
     jax_args, in_tree = tree_flatten((args, kwargs))
     jaxtree_fun, out_tree = flatten_fun(wrapped, in_tree)
-    in_pvals = map(pv_like, jax_args)
-    jaxpr, out_pvals, consts = pe.trace_to_jaxpr(
-        jaxtree_fun, in_pvals, instantiate=True, stage_out=True)
-    out_avals = map(raise_to_shaped, unzip2(out_pvals)[0])
-    in_avals = tuple(raise_to_shaped(in_aval) for in_aval, _ in in_pvals)
+    in_avals = map(xla.abstractify, jax_args)
+    jaxpr, out_avals, consts = pe.trace_to_jaxpr_dynamic(jaxtree_fun, in_avals)
+    in_avals = tuple(raise_to_shaped(in_aval) for in_aval in in_avals)
     typed_jaxpr = core.TypedJaxpr(jaxpr, consts, in_avals, out_avals)
     return typed_jaxpr
 
@@ -1900,13 +1825,11 @@ class CustomTransformsFunction(object):
     return '<jax.custom_transforms function {fun}>'.format(fun=self.__name__)
 
   def __call__(self, *args):
-    # TODO(mattjj): instead of tracing to a jaxpr, use process_call
     args_flat, in_tree = tree_flatten(args)
     flat_fun, out_tree = flatten_fun_nokwargs(lu.wrap_init(self.fun), in_tree)
     in_pvals = [pe.PartialVal.unknown(raise_to_shaped(core.get_aval(x)))
                 for x in args_flat]
-    with core.initial_style_staging():
-      jaxpr, _, consts = pe.trace_to_jaxpr(flat_fun, in_pvals, instantiate=True)
+    jaxpr, _, consts = pe.trace_to_jaxpr(flat_fun, in_pvals, instantiate=True)
     outs = self.prim.bind(*it.chain(consts, args_flat), jaxpr=jaxpr,
                           in_tree=in_tree, out_tree=out_tree(),
                           num_consts=len(consts))
@@ -2066,3 +1989,59 @@ def invertible(fun: Callable, concrete: bool = False) -> Callable:
                                    concrete=concrete)
     return tree_unflatten(out_tree(), out_flat)
   return fun_invertible
+
+
+# TODO(mattjj): remove backward compatibility shim for pre-omnistaging uses
+
+def deprecated_jit(fun: Callable, static_argnums: Iterable[int] = ()) -> Callable:
+  """Deprecated version of ``jit`` for backward compatibility.
+
+  Args:
+    fun: Function to be jitted. Should be a pure function, as side-effects may
+      only be executed once. Its arguments and return value should be arrays,
+      scalars, or (nested) standard Python containers (tuple/list/dict) thereof.
+    static_argnums: An int or collection of ints specifying which positional
+      arguments to treat as static (compile-time constant). Operations that only
+      depend on static arguments will be constant-folded in Python (during
+      tracing), and so the corrersponding argument values can be any Python
+      object. Calling the jitted function with different values for these
+      constants will trigger recompilation. If the jitted function is called
+      with fewer positional arguments than indicated by ``static_argnums`` then
+      an error is raised. Arguments that are not arrays or containers thereof
+      must be marked as static. Defaults to ().
+
+  Returns:
+    A wrapped version of ``fun``, set up for just-in-time compilation.
+  """
+  _check_callable(fun)
+  static_argnums = _ensure_tuple(static_argnums)
+
+  @cache()
+  def trace_to_jaxpr(f, in_tree, in_avals):
+    flat_fun, out_tree = flatten_fun(f, in_tree)
+    in_pvals = [pe.PartialVal.unknown(aval) for aval in in_avals]
+    jaxpr, _, consts = pe.trace_to_jaxpr(flat_fun, in_pvals, instantiate=True)
+    return pe.convert_constvars_jaxpr(jaxpr), consts, out_tree()
+
+  @wraps(fun)
+  def f_jitted(*args, **kwargs):
+    f = lu.wrap_init(fun)
+    if static_argnums:
+      dyn_argnums = [i for i in range(len(args)) if i not in static_argnums]
+      f, dyn_args = argnums_partial(f, dyn_argnums, args)
+    else:
+      dyn_args = args
+    args_flat, in_tree = tree_flatten((dyn_args, kwargs))
+    for arg in args_flat: _check_arg(arg)
+
+    # We simulate behavior of the old `jit` by running a partial eval pass.
+    in_avals = tuple(raise_to_shaped(core.get_aval(x)) for x in args_flat)
+    jaxpr, consts, out_tree = trace_to_jaxpr(f, in_tree, in_avals)
+    flat_fun = lu.hashable_partial(lu.wrap_init(core.eval_jaxpr), jaxpr, ())
+
+    donated_invars = (False,) * (len(consts) + len(args_flat))
+    out = xla.xla_call(flat_fun, *consts, *args_flat, device=None, backend=None,
+                       name=flat_fun.__name__, donated_invars=donated_invars)
+    return tree_unflatten(out_tree, out)
+
+  return f_jitted

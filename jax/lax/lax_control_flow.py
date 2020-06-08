@@ -46,7 +46,8 @@ from jax.lib import xla_client
 from jax.util import (partial, unzip2, unzip4, safe_map, safe_zip, split_list,
                       split_dict, cache, extend_name_stack)
 from jax.tree_util import (tree_flatten, tree_unflatten, treedef_is_leaf,
-                           treedef_children, treedef_tuple, tree_multimap)
+                           treedef_children, treedef_tuple, tree_multimap,
+                           tree_leaves, tree_map)
 from jax import ad_util
 
 xops = xla_client.ops
@@ -57,22 +58,18 @@ _reduce = functools.reduce
 
 @cache()
 def _initial_style_untyped_jaxpr(fun: Callable, in_tree, in_avals):
-  in_pvals = [pe.PartialVal.unknown(aval) for aval in in_avals]
   wrapped_fun, out_tree = flatten_fun_nokwargs(lu.wrap_init(fun), in_tree)
-  with core.initial_style_staging():
-    jaxpr, out_pvals, consts = pe.trace_to_jaxpr(
-      wrapped_fun, in_pvals, instantiate=True, stage_out=False)
-  return jaxpr, out_pvals, consts, out_tree
+  jaxpr, out_avals, consts = pe.trace_to_jaxpr_dynamic(wrapped_fun, in_avals)
+  return jaxpr, out_avals, consts, out_tree()
 
 @cache()
 def _initial_style_jaxpr(fun: Callable, in_tree, in_avals):
-  jaxpr, out_pvals, consts, out_tree = _initial_style_untyped_jaxpr(
-      fun, in_tree, in_avals)
-  out_avals = _map(raise_to_shaped, unzip2(out_pvals)[0])
+  jaxpr, out_avals, consts, out_tree = \
+      _initial_style_untyped_jaxpr(fun, in_tree, in_avals)
   const_avals = tuple(raise_to_shaped(core.get_aval(c)) for c in consts)
   typed_jaxpr = core.TypedJaxpr(pe.convert_constvars_jaxpr(jaxpr),
                                 (), const_avals + in_avals, out_avals)
-  return typed_jaxpr, consts, out_tree()
+  return typed_jaxpr, consts, out_tree
 
 def _initial_style_jaxprs_with_common_consts(funs: Sequence[Callable],
                                              in_tree, in_avals):
@@ -83,37 +80,29 @@ def _initial_style_jaxprs_with_common_consts(funs: Sequence[Callable],
   # for each one, it makes another that accepts *all* constants, but only uses
   # those that it needs (dropping the rest).
 
-  jaxprs, all_out_pvals, all_consts, all_out_trees = unzip4([
-      _initial_style_untyped_jaxpr(fun, in_tree, in_avals) for fun in funs])
+  jaxprs, all_out_avals, all_consts, all_out_trees = unzip4(
+      _initial_style_untyped_jaxpr(fun, in_tree, in_avals) for fun in funs)
 
   newvar = core.gensym(jaxprs, suffix='_')
-  all_const_avals = tuple(
-      tuple(raise_to_shaped(core.get_aval(c)) for c in consts)
-      for consts in all_consts)
-  unused_const_vars = tuple(
-      tuple(newvar(aval) for aval in const_avals)
-      for const_avals in all_const_avals)
+  all_const_avals = [[raise_to_shaped(core.get_aval(c)) for c in consts]
+                     for consts in all_consts]
+  unused_const_vars = [[newvar(aval) for aval in const_avals]
+                       for const_avals in all_const_avals]
 
   def pad_jaxpr_constvars(i, jaxpr):
     prefix = util.concatenate(unused_const_vars[:i])
     suffix = util.concatenate(unused_const_vars[i+1:])
-    constvars = prefix + jaxpr.constvars + suffix
+    constvars = [*prefix, *jaxpr.constvars, *suffix]
     return core.Jaxpr(constvars=constvars, invars=jaxpr.invars,
                       outvars=jaxpr.outvars, eqns=jaxpr.eqns)
 
-  const_avals = tuple(util.concatenate(all_const_avals))
-
-  def type_and_const_convert_jaxpr(jaxpr, out_pvals):
-    out_avals = _map(raise_to_shaped, unzip2(out_pvals)[0])
-    return core.TypedJaxpr(pe.convert_constvars_jaxpr(jaxpr),
-                           (), const_avals + in_avals, out_avals)
-
+  consts = util.concatenate(all_consts)
+  const_avals = util.concatenate(all_const_avals)
   jaxprs = [pad_jaxpr_constvars(i, jaxpr) for i, jaxpr in enumerate(jaxprs)]
-  typed_jaxprs = _map(type_and_const_convert_jaxpr, jaxprs, all_out_pvals)
-
-  return (tuple(typed_jaxprs),
-          tuple(util.concatenate(all_consts)),
-          tuple(out_tree() for out_tree in all_out_trees))
+  typed_jaxprs = [core.TypedJaxpr(pe.convert_constvars_jaxpr(jaxpr),
+                                  (), [*const_avals, *in_avals], out_avals)
+                  for jaxpr, out_avals in zip(jaxprs, all_out_avals)]
+  return typed_jaxprs, consts, all_out_trees
 
 def _abstractify(x):
   return raise_to_shaped(core.get_aval(x))
@@ -280,7 +269,6 @@ def while_loop(cond_fun, body_fun, init_val):
   in_tree_children = in_tree.children()
   assert len(in_tree_children) == 1
   _check_tree_and_avals("body_fun output and input",
-                        # Extract the subtree and avals for the first element of the return tuple
                         body_tree, body_jaxpr.out_avals,
                         in_tree_children[0], init_avals)
   outs = while_p.bind(*itertools.chain(cond_consts, body_consts, init_vals),
@@ -479,8 +467,7 @@ def _while_partial_eval(trace: pe.JaxprTrace, *tracers: pe.Tracer, cond_nconsts:
   carry_uk = carry_init_uk
   for _ in range(1 + len(carry_uk)):
     body_jaxpr_known, _, carry_out_uk = pe.partial_eval_jaxpr(
-        body_jaxpr, body_consts_uk + carry_uk, instantiate=carry_uk,
-        trace_type=trace.master.trace_type)
+        body_jaxpr, body_consts_uk + carry_uk, instantiate=carry_uk)
     if carry_out_uk == carry_uk:
       break
     else:
@@ -489,8 +476,7 @@ def _while_partial_eval(trace: pe.JaxprTrace, *tracers: pe.Tracer, cond_nconsts:
     assert False, "Fixpoint not reached"
 
   cond_jaxpr_known, _, cond_uk = pe.partial_eval_jaxpr(
-    cond_jaxpr, cond_consts_uk + carry_uk, instantiate=False,
-    trace_type=trace.master.trace_type)
+      cond_jaxpr, cond_consts_uk + carry_uk, instantiate=False)
 
   if cond_uk[0] or  all([not uk for uk in unknowns]) or all(unknowns):
     # If conditional is unknown, or all inputs are known, or all are unknown,
@@ -604,7 +590,7 @@ def switch(index, branches: Sequence[Callable], operand):
 
   linear = (False,) * (len(consts) + len(ops))
   out = cond_p.bind(
-      index, *consts, *ops, branches=jaxprs, linear=linear)
+      index, *consts, *ops, branches=tuple(jaxprs), linear=linear)
   return tree_unflatten(out_trees[0], out)
 
 
@@ -827,16 +813,14 @@ def _cond_partial_eval(trace, *tracers, branches, linear):
   branches_out_uks = []
   for branch_jaxpr in branches:
     _, _, out_uks = pe.partial_eval_jaxpr(branch_jaxpr, ops_uk,
-                                          instantiate=False,
-                                          trace_type=trace.master.trace_type)
+                                          instantiate=False)
     branches_out_uks.append(out_uks)
   out_uks = [any(uks) for uks in zip(*branches_out_uks)]
 
   branches_1, branches_2, branch_res_avals = [], [], []
   for branch_jaxpr in branches:
     branch_jaxpr_1, branch_jaxpr_2, _ = pe.partial_eval_jaxpr(
-        branch_jaxpr, ops_uk, instantiate=out_uks,
-        trace_type=trace.master.trace_type)
+        branch_jaxpr, ops_uk, instantiate=out_uks)
     branch_num_res = len(branch_jaxpr_1.out_avals) - len(out_uks)
 
     # move residuals to the front
@@ -1337,11 +1321,6 @@ def _prune_zeros(ts):
 
 def _scan_partial_eval(trace, *tracers, reverse, length, num_consts, num_carry,
                        jaxpr, linear):
-  if trace.master.trace_type is pe.StagingJaxprTrace:
-    params = {"reverse": reverse, "length": length, "num_consts": num_consts,
-              "num_carry": num_carry, "jaxpr": jaxpr, "linear": linear}
-    return trace.default_process_primitive(scan_p, tracers, params)
-
   num_ys = len(jaxpr.out_avals) - num_carry
 
   unknowns = [t.pval[0] is not None for t in tracers]
@@ -1356,9 +1335,8 @@ def _scan_partial_eval(trace, *tracers, reverse, length, num_consts, num_carry,
   for _ in range(1 + len(carry_uk)):
     unknowns = const_uk + carry_uk + xs_uk
     jaxpr_1, jaxpr_2, out_uk = pe.partial_eval_jaxpr(
-        jaxpr, unknowns, instantiate=carry_uk + [False] * num_ys,
-        trace_type=trace.master.trace_type)
-    carry_uk_out = out_uk[:num_carry]
+        jaxpr, unknowns, instantiate=carry_uk + [False] * num_ys)
+    carry_uk_out, _ = out_uk[:num_carry], out_uk[num_carry:]
     if carry_uk_out == carry_uk:
       break
     else:
@@ -1503,9 +1481,7 @@ def _transpose_scan_jaxpr(num_res1, num_c, num_res2, jaxpr):
   return _make_typed_jaxpr(transposed, res1_avals + c_avals + b_avals + res2_avals)
 
 def _make_typed_jaxpr(traceable: lu.WrappedFun, in_avals: Sequence[core.AbstractValue]):
-  pvals = [pe.PartialVal.unknown(aval) for aval in in_avals]
-  jaxpr, pvals_out, consts = pe.trace_to_jaxpr(traceable, pvals, instantiate=True)
-  out_avals, _ = unzip2(pvals_out)
+  jaxpr, out_avals, consts = pe.trace_to_jaxpr_dynamic(traceable, in_avals)
   return core.TypedJaxpr(jaxpr, consts, in_avals, _map(raise_to_shaped, out_avals))
 
 
@@ -1715,7 +1691,8 @@ def _stop_gradient_fun(f):
     args_avals = tuple(_map(_abstractify, args_flat))
     g = lambda a, b: f(*a, **b)
     jaxpr, consts, out_tree = _initial_style_jaxpr(g, in_args_tree, args_avals)
-    out = core.jaxpr_as_fun(jaxpr)(*lax.stop_gradient(consts + tuple(args_flat)))
+    all_args = _map(lax.stop_gradient, (*consts, *args_flat))
+    out = core.jaxpr_as_fun(jaxpr)(*all_args)
     return tree_unflatten(out_tree, out)
   return wrapper
 
@@ -2225,3 +2202,64 @@ def associative_scan(fn, elems):
   scans = _scan(elems_flat)
 
   return tree_unflatten(tree, scans)
+
+
+# TODO(mattjj): remove backward compatibility shims for pre-omnistaging uses
+# Known issues:
+#  * compiled op-by-op versions are never cached
+#  * may not preserve custom derivative rules
+
+def _deprecated_jaxpr(fun: Callable, *args):
+  args_flat, in_tree = tree_flatten(args)
+  in_avals = tuple(raise_to_shaped(get_aval(x)) for x in args_flat)
+  wrapped_fun, out_tree = flatten_fun_nokwargs(lu.wrap_init(fun), in_tree)
+  in_pvals = [pe.PartialVal.unknown(aval) for aval in in_avals]
+  jaxpr, out_avals, consts = pe.trace_to_jaxpr(wrapped_fun, in_pvals,
+                                               instantiate=True)
+  return jaxpr, consts, out_tree()
+
+def _deprecated_fun(fun: Callable, *args):
+  jaxpr, consts, out_tree = _deprecated_jaxpr(fun, *args)
+  def new_fun(args):
+    out_flat = core.eval_jaxpr(jaxpr, consts, *tree_leaves(args))
+    return tree_unflatten(out_tree, out_flat)
+  return new_fun
+
+def deprecated_while_loop(cond_fun, body_fun, init_val):
+  """Deprecated version of ``while_loop`` for backward compatibility."""
+  new_cond_fun = _deprecated_fun(cond_fun, init_val)
+  new_body_fun = _deprecated_fun(body_fun, init_val)
+  return while_loop(new_cond_fun, new_body_fun, init_val)
+
+def deprecated_fori_loop(lower, upper, body_fun, init_val):
+  """Deprecated version of ``fori_loop`` for backward compatibility."""
+  lower_dtype = dtypes.canonicalize_dtype(lax.dtype(lower))
+  upper_dtype = dtypes.canonicalize_dtype(lax.dtype(upper))
+  if lower_dtype != upper_dtype:
+    msg = ("lower and upper arguments to fori_loop must have equal types, "
+           "got {} and {}")
+    raise TypeError(msg.format(lower_dtype.name, upper_dtype.name))
+
+  _, _, result = deprecated_while_loop(_fori_cond_fun, _fori_body_fun(body_fun),
+                                       (lower, upper, init_val))
+  return result
+
+
+def deprecated_cond(pred, true_operand, true_fun, false_operand, false_fun):
+  """Deprecated version of ``cond`` for backward compatibility."""
+  new_true_fun = _deprecated_fun(true_fun, true_operand)
+  new_false_fun = _deprecated_fun(false_fun, false_operand)
+  return cond(pred, true_operand, new_true_fun, false_operand, new_false_fun)
+
+def deprecated_scan(f, init, xs, length=None):
+  """Deprecated version of ``scan`` for backward compatibility."""
+  try:
+    xs_slice = tree_map(operator.itemgetter(0), xs)
+  except IndexError:
+    xs_slice = tree_map(lambda x: onp.zeros(x.shape[1:], x.dtype), xs)
+  jaxpr, consts, out_tree = _deprecated_jaxpr(f, init, xs_slice)
+  def new_f(c, x):
+    out_flat = core.eval_jaxpr(jaxpr, consts, *tree_leaves((c, x)))
+    new_c, y = tree_unflatten(out_tree, out_flat)
+    return new_c, y
+  return scan(new_f, init, xs, length=length)

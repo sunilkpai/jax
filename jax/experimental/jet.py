@@ -26,6 +26,7 @@ from jax.tree_util import (register_pytree_node, tree_structure,
                            treedef_is_leaf, tree_flatten, tree_unflatten)
 import jax.linear_util as lu
 from jax.interpreters import xla
+from jax.custom_derivatives import custom_jvp_call_jaxpr_p
 from jax.lax import lax
 from jax.lax import lax_fft
 
@@ -113,7 +114,6 @@ class JetTrace(core.Trace):
     return JetTracer(self, val.primal, val.terms)
 
   def process_primitive(self, primitive, tracers, params):
-    assert not primitive.multiple_results  # TODO
     order = self.master.order              # pytype: disable=attribute-error
     primals_in, series_in = unzip2((t.primal, t.terms) for t in tracers)
     series_in = [[zero_term] * order if s is zero_series else s
@@ -124,18 +124,18 @@ class JetTrace(core.Trace):
                  for x, series in zip(primals_in, series_in)]
     rule = jet_rules[primitive]
     primal_out, terms_out = rule(primals_in, series_in, **params)
-    return JetTracer(self, primal_out, terms_out)
+    if not primitive.multiple_results:
+      return JetTracer(self, primal_out, terms_out)
+    else:
+      return [JetTracer(self, p, ts) for p, ts in zip(primal_out, terms_out)]
 
   def process_call(self, call_primitive, f, tracers, params):
     primals_in, series_in = unzip2((t.primal, t.terms) for t in tracers)
     primals_and_series, in_tree_def = tree_flatten((primals_in, series_in))
     f_jet, out_tree_def = traceable(jet_subtrace(f, self.master), in_tree_def)
-    new_params = dict(params)
-    if "donated_invars" in params:
-      if any(params["donated_invars"]):
-        raise ValueError("Buffer donation is not supported with jet.")
-      new_donated_invars = (False,) * len(primals_and_series)
-      new_params["donated_invars"] = new_donated_invars
+    update_params = call_param_updaters.get(call_primitive)
+    new_params = (update_params(params, len(primals_and_series))
+                  if update_params else params)
     result = call_primitive.bind(f_jet, *primals_and_series, **new_params)
     primals_out, series_out = tree_unflatten(out_tree_def(), result)
     return [JetTracer(self, p, ts) for p, ts in zip(primals_out, series_out)]
@@ -162,6 +162,16 @@ register_pytree_node(ZeroTerm, lambda z: ((), None), lambda _, xs: zero_term)
 class ZeroSeries(object): pass
 zero_series = ZeroSeries()
 register_pytree_node(ZeroSeries, lambda z: ((), None), lambda _, xs: zero_series)
+
+
+call_param_updaters = {}
+
+def _xla_call_param_updater(params, num_inputs):
+  donated_invars = params['donated_invars']
+  if any(donated_invars):
+    raise NotImplementedError("donated_invars not supported with jet")
+  return dict(params, donated_invars=(False,) * num_inputs)
+call_param_updaters[xla.xla_call_p] = _xla_call_param_updater
 
 
 ### rule definitions
@@ -223,7 +233,6 @@ deflinear(lax.transpose_p)
 deflinear(lax.slice_p)
 deflinear(lax.reduce_sum_p)
 deflinear(lax.reduce_window_sum_p)
-deflinear(lax.tie_in_p)
 deflinear(lax_fft.fft_p)
 deflinear(xla.device_put_p)
 
@@ -547,3 +556,10 @@ def _lax_min_taylor_rule(primal_in, series_in):
     series_out = [select_min_and_avg_eq(*terms_in) for terms_in in zip(*series_in)]
     return primal_out, series_out
 jet_rules[lax.min_p] = _lax_min_taylor_rule
+
+def _custom_jvp_call_jaxpr_rule(primals_in, series_in, *, fun_jaxpr,
+                                jvp_jaxpr_thunk):
+  # TODO(mattjj): do something better than ignoring custom jvp rules for jet?
+  del jvp_jaxpr_thunk
+  return jet(core.jaxpr_as_fun(fun_jaxpr), primals_in, series_in)
+jet_rules[custom_jvp_call_jaxpr_p] = _custom_jvp_call_jaxpr_rule
