@@ -29,7 +29,7 @@
 # replica groups for collective operations.
 
 from collections import defaultdict
-from itertools import product
+import itertools as it
 import operator as op
 from typing import (Any, Callable, Dict, List, Optional, Sequence, Set, Tuple,
                     Type, Union)
@@ -37,7 +37,7 @@ from typing import (Any, Callable, Dict, List, Optional, Sequence, Set, Tuple,
 from absl import logging
 import numpy as onp
 
-from ..config import flags
+from ..config import config, flags
 from .. import core
 from .. import linear_util as lu
 from .. import lazy
@@ -164,7 +164,7 @@ def spec_to_indices(shape: Tuple[int, ...],
       logical_index += 1
   assert logical_index == len(shape) and not replication_factors
 
-  indices = list(product(*indices_per_mesh_axis))
+  indices = list(it.product(*indices_per_mesh_axis))
 
   # remove placeholder `None`s and trailing colons, then unwrap
   # single-element tuples
@@ -534,7 +534,11 @@ def parallel_callable(fun, backend, axis_name, axis_size, global_axis_size,
   sharded_avals = tuple(shard_aval(axis_size, aval) if m else aval
                         for m, aval in zip(mapped_invars, avals))
   with core.extend_axis_env(axis_name, axis_size):
-    jaxpr, out_avals, consts = pe.trace_to_jaxpr_final(fun, sharded_avals)
+    if config.read("jax_omnistaging"):
+      jaxpr, out_avals, consts = pe.trace_to_jaxpr_final(fun, sharded_avals)
+    else:
+      jaxpr, out_avals, consts = pe.partial_eval_to_jaxpr_final(fun, sharded_avals)
+  map(xla.prefetch, it.chain(consts, xla.jaxpr_literals(jaxpr)))
   jaxpr = xla.apply_outfeed_rewriter(jaxpr)
 
   # TODO(skye,mattjj): allow more collectives on multi-host as we test them, but
@@ -1029,14 +1033,20 @@ def _soft_pmap_interp(chunk_size, jaxpr, consts, mapped_invars, *args):
     elif isinstance(eqn.primitive, core.MapPrimitive):
       raise NotImplementedError  # TODO
     else:
-      rule = batching.get_primitive_batcher(eqn.primitive)
-      in_axes = [0 if m else batching.not_mapped for m in in_mapped]
-      out_vals, out_axes = rule(in_vals, in_axes, **eqn.params)
-      if not eqn.primitive.multiple_results:
-        out_vals, out_axes = [out_vals], [out_axes]
-      out_vals = [moveaxis(x, d, 0) if d is not not_mapped and d != 0 else x
-                  for x, d in zip(out_vals, out_axes)]
-      out_mapped = [d is not not_mapped for d in out_axes]
+      if any(in_mapped):
+        rule = batching.get_primitive_batcher(eqn.primitive)
+        in_axes = [0 if m else batching.not_mapped for m in in_mapped]
+        out_vals, out_axes = rule(in_vals, in_axes, **eqn.params)
+        if not eqn.primitive.multiple_results:
+          out_vals, out_axes = [out_vals], [out_axes]
+        out_vals = [moveaxis(x, d, 0) if d is not not_mapped and d != 0 else x
+                    for x, d in zip(out_vals, out_axes)]
+        out_mapped = [d is not not_mapped for d in out_axes]
+      else:
+        out_vals = eqn.primitive.bind(*in_vals, **eqn.params)
+        if not eqn.primitive.multiple_results:
+          out_vals = [out_vals]
+        out_mapped = [False for _ in out_vals]
     map(write, eqn.outvars, out_vals, out_mapped)
 
   out_vals, out_mapped = unzip2(map(read, jaxpr.outvars))

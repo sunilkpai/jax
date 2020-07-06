@@ -72,7 +72,8 @@ def _initial_style_jaxpr(fun, in_avals):
   return typed_jaxpr
 
 def _initial_style_staging():
-  return core.trace_state.trace_stack.dynamic.level != 0
+  return (core.trace_state.trace_stack.dynamic.level != 0
+          or core.trace_state.initial_style_staging)
 
 def _sum_tangents(_, x, *xs):
   return reduce(ad.add_tangents, xs, x)

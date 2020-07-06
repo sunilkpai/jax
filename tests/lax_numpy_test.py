@@ -3664,6 +3664,9 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     foo(np.zeros((2, 2)))  # doesn't crash
 
   def testReluGradientConstants(self):
+    if not config.read("jax_omnistaging"):
+      raise SkipTest("test only passes with omnistaging b/c tie_in is gone")
+
     # This is a regression test that verifies that constants associated with the
     # gradient of np.maximum (from lax._balanced_eq) aren't hoisted into the
     # outermost jaxpr. This was producing some large materialized constants for

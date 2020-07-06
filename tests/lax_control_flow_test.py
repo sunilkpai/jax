@@ -28,6 +28,7 @@ import numpy as np
 import numpy.random as npr
 
 from jax import api
+from jax import core
 from jax import lax
 from jax import random
 from jax import test_util as jtu
@@ -426,8 +427,9 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     self.assertEqual(count(3), 3)
     self.assertEqual(count(4), 6)
 
-    for args_maker in [lambda: [2], lambda: [3], lambda: [4]]:
-      self._CompileAndCheck(count, args_maker)
+    if config.read("jax_omnistaging"):  # caching only works with omnistaging
+      for args_maker in [lambda: [2], lambda: [3], lambda: [4]]:
+        self._CompileAndCheck(count, args_maker)
 
   def testForiLoopClosure(self):
     def count(num):
@@ -1685,6 +1687,9 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     self.assertAllClose(ans, expected)
 
   def testCaching(self):
+    if not config.read("jax_omnistaging"):
+      raise SkipTest("caching is disabled without omnistaging")
+
     def cond(x):
       assert python_should_be_executing
       return x < 5
@@ -2283,6 +2288,8 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     self.assertAllClose(ans, expected, check_dtypes=False)
 
   def test_while_loop_of_pmap_error_message(self):
+    if not config.read("jax_omnistaging"):
+      raise SkipTest("error message is slightly different w/o omnistaging")
 
     def body(i, x):
       result = api.pmap(lambda z: lax.psum(jnp.sin(z), 'i'), axis_name='i')(x)
@@ -2354,6 +2361,21 @@ class LaxControlFlowTest(jtu.JaxTestCase):
                         check_dtypes=False)
     self.assertAllClose(result.second, np.array([0., 10., 30.]),
                         check_dtypes=False)
+
+  def testPartialEvalBehavior(self):
+    if config.read("jax_omnistaging"):
+      raise SkipTest("test is for behavior when jax_omnistaging=false")
+
+    stashed = None
+
+    def f(c):
+      nonlocal stashed
+      stashed = jnp.sin(3.)
+      return c
+
+    lax.scan(lambda c, _: (f(c), None), 1., None, length=1)
+
+    self.assertNotIsInstance(stashed, core.Tracer)
 
 
 if __name__ == '__main__':

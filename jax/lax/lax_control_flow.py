@@ -49,6 +49,7 @@ from jax.tree_util import (tree_flatten, tree_unflatten, treedef_is_leaf,
                            treedef_children, treedef_tuple, tree_multimap,
                            tree_leaves, tree_map)
 from jax import ad_util
+from jax.config import config
 
 xops = xla_client.ops
 
@@ -59,7 +60,8 @@ _reduce = functools.reduce
 @cache()
 def _initial_style_untyped_jaxpr(fun: Callable, in_tree, in_avals):
   wrapped_fun, out_tree = flatten_fun_nokwargs(lu.wrap_init(fun), in_tree)
-  jaxpr, out_avals, consts = pe.trace_to_jaxpr_dynamic(wrapped_fun, in_avals)
+  with core.initial_style_staging():
+    jaxpr, out_avals, consts = pe.trace_to_jaxpr_dynamic(wrapped_fun, in_avals)
   return jaxpr, out_avals, consts, out_tree()
 
 @cache()
@@ -254,6 +256,10 @@ def while_loop(cond_fun, body_fun, init_val):
       # Can't run this while_loop in Python (e.g. because there's a vmap
       # transformation on it), so we fall back to the primitive version.
       pass
+
+  if not config.read("jax_omnistaging"):
+    cond_fun = _deprecated_fun(cond_fun, init_val)
+    body_fun = _deprecated_fun(body_fun, init_val)
 
   init_vals, in_tree = tree_flatten((init_val,))
   init_avals = tuple(_map(_abstractify, init_vals))
@@ -607,9 +613,9 @@ def cond(*args, **kwargs):
 
   Pred must be a scalar type.
 
-  Note that true_fun/false_fun may not need to refer to an `operand` to compute
-  their result, but one must still be provided to the `cond` call and be
-  accepted by both the branch functions, e.g.:
+  Note that true_fun/false_fun may not need to refer to an ``operand`` to
+  compute their result, but one must still be provided to the ``cond`` call and
+  be accepted by both the branch functions, e.g.:
 
       jax.lax.cond(
           get_predicate_value(),
@@ -619,11 +625,17 @@ def cond(*args, **kwargs):
 
 
   Arguments:
-    pred: Boolean scalar type, indicating which branch function to
-      apply. Collections (list, tuple) are not supported.
-    true_fun: Function (A -> B), to be applied if `pred` is True.
-    false_fun: Function (A -> B), to be applied if `pred` is False.
-    operand: Operand (A) input to either branch depending on `pred`.
+    pred: Boolean scalar type, indicating which branch function to apply.
+    true_fun: Function (A -> B), to be applied if ``pred`` is True.
+    false_fun: Function (A -> B), to be applied if ``pred`` is False.
+    operand: Operand (A) input to either branch depending on ``pred``. The type
+      can be a scalar, array, or any pytree (nested Python tuple/list/dict)
+      thereof.
+
+  Returns:
+    Value (B) of either ``true_fun(operand)`` or ``false_fun(operand)``,
+    depending on the value of ``pred``. The type can be a scalar, array, or any
+    pytree (nested Python tuple/list/dict) thereof.
   """
 
   # detect an attempt to call the former, deprecated cond
@@ -659,6 +671,10 @@ def _cond(pred, true_fun: Callable, false_fun: Callable, operand):
       return true_fun(operand)
     else:
       return false_fun(operand)
+
+  if not config.read("jax_omnistaging"):
+    true_fun = _deprecated_fun(true_fun, operand)
+    false_fun = _deprecated_fun(false_fun, operand)
 
   ops, ops_tree = tree_flatten((operand,))
   ops_avals = tuple(_map(_abstractify, ops))
@@ -1152,7 +1168,45 @@ def scan(f, init, xs, length=None, reverse=False):
   init_flat, init_tree = tree_flatten(init)
   xs_flat, xs_tree = tree_flatten(xs)
   in_flat, in_tree = tree_flatten((init, xs))
+  length = _scan_length(xs_flat, length)
 
+  if jax.api._jit_is_disabled():
+    carry = init
+    ys = []
+    maybe_reversed = reversed if reverse else lambda x: x
+    for i in maybe_reversed(range(length)):
+      xs_slice = [_index_array(i, core.get_aval(x), x) for x in xs_flat]
+      carry, y = f(carry, tree_unflatten(xs_tree, xs_slice))
+      ys.append(y)
+    stack = lambda y, *ys: (y if core.get_aval(y) is core.abstract_unit
+                            else jax.numpy.stack((y, *ys)))
+    ys = tree_multimap(stack, *maybe_reversed(ys))
+    return carry, ys
+
+  if not config.read("jax_omnistaging"):
+    f = deprecated_scan_fun(f, init, xs, length)
+
+  carry_avals = tuple(_map(_abstractify, init_flat))
+  x_shapes = [masking.padded_shape_as_value(x.shape[1:]) for x in xs_flat]
+  x_dtypes = [x.dtype for x in xs_flat]
+  x_avals = tuple(_map(ShapedArray, x_shapes, x_dtypes))
+  jaxpr, consts, out_tree = _initial_style_jaxpr(f, in_tree, carry_avals + x_avals)
+  out_tree_children = out_tree.children()
+  if len(out_tree_children) != 2:
+    msg = "scan body output must be a pair, got {}."
+    raise TypeError(msg.format(tree_unflatten(out_tree, jaxpr.out_avals)))
+  _check_tree_and_avals("scan carry output and input",
+                        # Extract the subtree and avals for the first element of the return tuple
+                        out_tree_children[0], jaxpr.out_avals[:out_tree_children[0].num_leaves],
+                        init_tree, carry_avals)
+
+  out = scan_p.bind(*itertools.chain(consts, in_flat),
+                    reverse=reverse, length=length, jaxpr=jaxpr,
+                    num_consts=len(consts), num_carry=len(init_flat),
+                    linear=(False,) * (len(consts) + len(in_flat)))
+  return tree_unflatten(out_tree, out)
+
+def _scan_length(xs_flat, length):
   try:
     lengths = [x.shape[0] for x in xs_flat]
   except AttributeError as err:
@@ -1178,38 +1232,7 @@ def scan(f, init, xs, length=None, reverse=False):
     else:
       length, = unique_lengths
 
-  if jax.api._jit_is_disabled():
-    carry = init
-    ys = []
-    maybe_reversed = reversed if reverse else lambda x: x
-    for i in maybe_reversed(range(length)):
-      xs_slice = [_index_array(i, core.get_aval(x), x) for x in xs_flat]
-      carry, y = f(carry, tree_unflatten(xs_tree, xs_slice))
-      ys.append(y)
-    stack = lambda y, *ys: (y if core.get_aval(y) is core.abstract_unit
-                            else jax.numpy.stack((y, *ys)))
-    ys = tree_multimap(stack, *maybe_reversed(ys))
-    return carry, ys
-
-  carry_avals = tuple(_map(_abstractify, init_flat))
-  x_shapes = [masking.padded_shape_as_value(x.shape[1:]) for x in xs_flat]
-  x_dtypes = [x.dtype for x in xs_flat]
-  x_avals = tuple(_map(ShapedArray, x_shapes, x_dtypes))
-  jaxpr, consts, out_tree = _initial_style_jaxpr(f, in_tree, carry_avals + x_avals)
-  out_tree_children = out_tree.children()
-  if len(out_tree_children) != 2:
-    msg = "scan body output must be a pair, got {}."
-    raise TypeError(msg.format(tree_unflatten(out_tree, jaxpr.out_avals)))
-  _check_tree_and_avals("scan carry output and input",
-                        # Extract the subtree and avals for the first element of the return tuple
-                        out_tree_children[0], jaxpr.out_avals[:out_tree_children[0].num_leaves],
-                        init_tree, carry_avals)
-
-  out = scan_p.bind(*itertools.chain(consts, in_flat),
-                    reverse=reverse, length=length, jaxpr=jaxpr,
-                    num_consts=len(consts), num_carry=len(init_flat),
-                    linear=(False,) * (len(consts) + len(in_flat)))
-  return tree_unflatten(out_tree, out)
+  return length
 
 def _scan_impl(*args, reverse, length, num_consts, num_carry, jaxpr, linear):
   consts, init, xs = split_list(args, [num_consts, num_carry])
@@ -2209,57 +2232,44 @@ def associative_scan(fn, elems):
 #  * compiled op-by-op versions are never cached
 #  * may not preserve custom derivative rules
 
-def _deprecated_jaxpr(fun: Callable, *args):
-  args_flat, in_tree = tree_flatten(args)
-  in_avals = tuple(raise_to_shaped(get_aval(x)) for x in args_flat)
+def _deprecated_jaxpr(fun: Callable, *avals):
+  avals_flat, in_tree = tree_flatten(avals)
+  in_avals = tuple(raise_to_shaped(aval) for aval in avals_flat)
   wrapped_fun, out_tree = flatten_fun_nokwargs(lu.wrap_init(fun), in_tree)
   in_pvals = [pe.PartialVal.unknown(aval) for aval in in_avals]
-  jaxpr, out_avals, consts = pe.trace_to_jaxpr(wrapped_fun, in_pvals,
-                                               instantiate=True)
+  with core.initial_style_staging():
+    jaxpr, out_avals, consts = pe.trace_to_jaxpr(wrapped_fun, in_pvals,
+                                                instantiate=True)
   return jaxpr, consts, out_tree()
 
 def _deprecated_fun(fun: Callable, *args):
-  jaxpr, consts, out_tree = _deprecated_jaxpr(fun, *args)
+  avals = _map(partial(tree_map, _abstractify), args)
+  jaxpr, consts, out_tree = _deprecated_jaxpr(fun, *avals)
   def new_fun(args):
     out_flat = core.eval_jaxpr(jaxpr, consts, *tree_leaves(args))
     return tree_unflatten(out_tree, out_flat)
   return new_fun
 
-def deprecated_while_loop(cond_fun, body_fun, init_val):
-  """Deprecated version of ``while_loop`` for backward compatibility."""
-  new_cond_fun = _deprecated_fun(cond_fun, init_val)
-  new_body_fun = _deprecated_fun(body_fun, init_val)
-  return while_loop(new_cond_fun, new_body_fun, init_val)
+# def deprecated_cond(pred, true_operand, true_fun, false_operand, false_fun):
+#   """Deprecated version of ``cond`` for backward compatibility."""
+#   new_true_fun = _deprecated_fun(true_fun, true_operand)
+#   new_false_fun = _deprecated_fun(false_fun, false_operand)
+#   return cond(pred, true_operand, new_true_fun, false_operand, new_false_fun)
 
-def deprecated_fori_loop(lower, upper, body_fun, init_val):
-  """Deprecated version of ``fori_loop`` for backward compatibility."""
-  lower_dtype = dtypes.canonicalize_dtype(lax.dtype(lower))
-  upper_dtype = dtypes.canonicalize_dtype(lax.dtype(upper))
-  if lower_dtype != upper_dtype:
-    msg = ("lower and upper arguments to fori_loop must have equal types, "
-           "got {} and {}")
-    raise TypeError(msg.format(lower_dtype.name, upper_dtype.name))
+def deprecated_scan_fun(f, init, xs, length):
+  init_avals = tree_map(_abstractify, init)
+  xs_flat, xs_tree = tree_flatten(xs)
+  xs_avals_flat = _map(_abstractify, xs_flat)
+  x_avals_flat = _map(partial(core.mapped_aval, length), xs_avals_flat)
+  x_avals = tree_unflatten(xs_tree, x_avals_flat)
 
-  _, _, result = deprecated_while_loop(_fori_cond_fun, _fori_body_fun(body_fun),
-                                       (lower, upper, init_val))
-  return result
-
-
-def deprecated_cond(pred, true_operand, true_fun, false_operand, false_fun):
-  """Deprecated version of ``cond`` for backward compatibility."""
-  new_true_fun = _deprecated_fun(true_fun, true_operand)
-  new_false_fun = _deprecated_fun(false_fun, false_operand)
-  return cond(pred, true_operand, new_true_fun, false_operand, new_false_fun)
-
-def deprecated_scan(f, init, xs, length=None):
-  """Deprecated version of ``scan`` for backward compatibility."""
-  try:
-    xs_slice = tree_map(operator.itemgetter(0), xs)
-  except IndexError:
-    xs_slice = tree_map(lambda x: onp.zeros(x.shape[1:], x.dtype), xs)
-  jaxpr, consts, out_tree = _deprecated_jaxpr(f, init, xs_slice)
+  jaxpr, consts, out_tree = _deprecated_jaxpr(f, init_avals, x_avals)
+  if len(out_tree.children()) != 2:
+    out_avals = [v.aval for v in jaxpr.outvars]
+    msg = "scan body output must be a pair, got {}."
+    raise TypeError(msg.format(tree_unflatten(out_tree, out_avals)))
   def new_f(c, x):
     out_flat = core.eval_jaxpr(jaxpr, consts, *tree_leaves((c, x)))
     new_c, y = tree_unflatten(out_tree, out_flat)
     return new_c, y
-  return scan(new_f, init, xs, length=length)
+  return new_f

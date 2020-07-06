@@ -14,6 +14,7 @@
 
 
 import threading
+import unittest
 
 from absl.testing import absltest
 import jax
@@ -30,6 +31,9 @@ FLAGS = config.FLAGS
 class InfeedTest(jtu.JaxTestCase):
 
   def testInfeed(self):
+    if not config.read("jax_omnistaging"):
+      raise unittest.SkipTest("infeed requires omnistaging")
+
     @jax.jit
     def f(x):
       token = lax.create_token(x)
@@ -48,6 +52,9 @@ class InfeedTest(jtu.JaxTestCase):
     self.assertAllClose(f(x), x + y + z)
 
   def testInfeedThenOutfeed(self):
+    if not config.read("jax_omnistaging"):
+      raise unittest.SkipTest("infeed requires omnistaging")
+
     hcb.stop_outfeed_receiver()
     @jax.jit
     def f(x):
@@ -69,6 +76,9 @@ class InfeedTest(jtu.JaxTestCase):
     self.assertAllClose(out, y + onp.float32(1))
 
   def testInfeedThenOutfeedInALoop(self):
+    if not config.read("jax_omnistaging"):
+      raise unittest.SkipTest("infeed requires omnistaging")
+
     hcb.stop_outfeed_receiver()
     def doubler(_, token):
       y, token = lax.infeed(

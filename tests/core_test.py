@@ -193,7 +193,8 @@ class CoreTest(jtu.JaxTestCase):
     jtu.check_jvp(f, partial(jvp_unlinearized, f), args,
                   rtol={np.float32: 3e-2})
 
-  @parameterized.parameters(test_specs)
+  @parameterized.named_parameters(
+      (str(i), *spec) for i, spec in enumerate(test_specs))
   def test_vjp(self, f, args):
     jtu.check_vjp(f, partial(vjp, f), args,
                   rtol={np.float32: 3e-1, np.float64: 1e-5},

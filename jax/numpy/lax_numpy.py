@@ -3877,6 +3877,7 @@ def _gcd_body_fn(xs):
   return (where(x1 < x2, x2, x1), where(x1 < x2, x1, x2))
 
 @_wraps(getattr(np, "gcd", None))
+@jit
 def gcd(x1, x2):
   if (not issubdtype(_dtype(x1), integer) or
       not issubdtype(_dtype(x2), integer)):
@@ -3889,6 +3890,7 @@ def gcd(x1, x2):
 
 
 @_wraps(getattr(np, "lcm", None))
+@jit
 def lcm(x1, x2):
   x1, x2 = _promote_dtypes(x1, x2)
   d = gcd(x1, x2)

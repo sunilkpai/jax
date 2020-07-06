@@ -33,6 +33,7 @@ from ..core import (Trace, Tracer, new_master, Jaxpr, Literal, get_aval,
                     AbstractValue, unit, unitvar, abstract_unit,
                     TypedJaxpr, new_jaxpr_eqn, dropvar)
 from .. import source_info_util
+from ..config import config
 
 map = safe_map
 zip = safe_zip
@@ -134,24 +135,25 @@ class JaxprTrace(Trace):
       return JaxprTracer(self, PartialVal.unknown(aval), ConstVar(const))
 
   def process_primitive(self, primitive, tracers, params):
-    if primitive in custom_partial_eval_rules:
+    # TODO(mattjj): remove 'self.master is dynamic' check when omnistaging-only
+    staging = self.master is core.trace_state.trace_stack.dynamic
+    if all(t.is_known() for t in tracers) and primitive is not core.axis_index_p:
+      if staging:
+        return primitive.impl(*(t.pval.get_known() for t in tracers), **params)
+      else:
+        return primitive.bind(*(t.pval.get_known() for t in tracers), **params)
+    if primitive in custom_partial_eval_rules and not staging:
       return custom_partial_eval_rules[primitive](self, *tracers, **params)
-    else:
-      return self.default_process_primitive(primitive, tracers, params)
+    return self.default_process_primitive(primitive, tracers, params)
 
   def default_process_primitive(self, primitive, tracers, params):
-    """By default, if all the input tracers are known, then execute the primitive
-    and all the ouputs are known. Otherwise, all the outputs are unknown."""
-    consts = [t.pval.get_known() for t in tracers]
-    if all(c is not None for c in consts):
-      return primitive.bind(*consts, **params)
     tracers = map(self.instantiate_const, tracers)
     avals = [t.aval for t in tracers]
     out_aval = primitive.abstract_eval(*avals, **params)
     source = source_info_util.current()
     if primitive.multiple_results:
       out_tracers = [JaxprTracer(self, PartialVal.unknown(aval), None)
-                     for aval in out_aval]
+                    for aval in out_aval]
       eqn = new_eqn_recipe(tracers, out_tracers, primitive, params, source)
       for t in out_tracers: t.recipe = eqn
       return out_tracers
@@ -163,7 +165,11 @@ class JaxprTrace(Trace):
 
   # We use process_call to handle both call and map primitives.
   def process_call(self, primitive, f: lu.WrappedFun, tracers, params):
-    if primitive in call_partial_eval_rules:
+    # TODO(mattjj): remove 'self.master is dynamic' check when omnistaging-only
+    staging = self.master is core.trace_state.trace_stack.dynamic
+    if staging:
+      tracers = map(self.instantiate_const_abstracted, tracers)
+    elif primitive in call_partial_eval_rules:
       return call_partial_eval_rules[primitive](self, primitive, f, tracers, params)
 
     in_pvals = [t.pval for t in tracers]
@@ -172,8 +178,14 @@ class JaxprTrace(Trace):
       in_pvals = [pval if pval.is_known() or not is_mapped
                   else PartialVal.unknown(mapped_aval(pval[0]))
                   for pval, is_mapped in zip(in_pvals, params['mapped_invars'])]
-    jaxpr, out_pvals, consts, env_tracers = self.partial_eval(
-        f, in_pvals, partial(primitive.bind, **params))
+    if staging:
+      f = trace_to_subjaxpr(f, self.master, True)
+      with maybe_extend_axis_env(params.get('axis_name'), params.get('axis_size')):
+        jaxpr, (out_pvals, consts, env_tracers) = f.call_wrapped(in_pvals)
+      env_tracers = map(self.full_raise, env_tracers)
+    else:
+      jaxpr, out_pvals, consts, env_tracers = self.partial_eval(
+          f, in_pvals, partial(primitive.bind, **params))
     if primitive.map_primitive:
       unmapped_aval = partial(core.unmapped_aval, params['axis_size'])
       out_pvals = [pval if pval.is_known()
@@ -211,7 +223,7 @@ class JaxprTrace(Trace):
     new_params = dict(params, call_jaxpr=convert_constvars_jaxpr(jaxpr))
     if primitive.map_primitive:
       mapped_invars = params['mapped_invars']
-      new_mapped_invars = ((True,) * len(const_tracers) +
+      new_mapped_invars = ((not staging,) * len(const_tracers) +
                            (False,) * len(env_tracers) +
                            tuple(v for v, t in zip(mapped_invars, tracers)
                                  if not t.pval.is_known()))
@@ -219,6 +231,13 @@ class JaxprTrace(Trace):
     update_params = call_param_updaters.get(primitive)
     if update_params:
       new_params = update_params(new_params, [not t.pval.is_known() for t in tracers])
+
+    if not core.skip_checks:
+      in_avals = [raise_to_shaped(t.pval.get_aval()) for t in in_tracers]
+      if primitive.map_primitive:
+        core.check_map(primitive, in_avals, new_params)
+      else:
+        core.check_call(primitive, in_avals, new_params)
 
     eqn = new_eqn_recipe(in_tracers, unknown_tracers_out, primitive, new_params,
                          source_info_util.current())
@@ -810,9 +829,6 @@ class JaxprTracer2(core.Tracer):
   def __bool__(self):
     self._concretization_error('__bool__')
 
-  def __int__(self):
-    self._concretization_error('__int__')
-
   def _concretization_error(self, name):
     msgs = self._progenitor_messages()
     msg = (f"Abstract tracer value passed to {name} for which a concrete value "
@@ -825,7 +841,6 @@ class JaxprTracer2(core.Tracer):
 
   def _progenitor_messages(self):
     progenitor_eqns = self._trace.frame.find_progenitors(self)
-    # TODO mention which jit this tracer belongs to
     msgs = [f"  operation {core.pp_eqn(eqn, print_shapes=True)}\n"
             f"    from line {source_info_util.summarize(eqn.source_info)}"
             for eqn in progenitor_eqns]
@@ -1036,3 +1051,31 @@ def fun_sourceinfo(fun):
     return f"{fun.__name__} at {filename}:{lineno}"
   except AttributeError:
     return "<unknown>"
+
+# TODO(mattjj): remove these when omnistaging-only
+
+def partial_eval_to_jaxpr_dynamic(fun: lu.WrappedFun, in_avals: Sequence[AbstractValue]):
+  assert not config.read("jax_omnistaging")
+  in_pvals = [PartialVal.unknown(a) for a in in_avals]
+  jaxpr, out_pvals, consts = trace_to_jaxpr(fun, in_pvals, True)
+  out_avals, _ = unzip2(out_pvals)
+  out_avals = map(raise_to_shaped, out_avals)
+  return jaxpr, out_avals, consts
+
+def partial_eval_to_jaxpr_final(fun: lu.WrappedFun, in_avals: Sequence[AbstractValue]):
+  assert not config.read("jax_omnistaging")
+  with core.new_base_master(JaxprTrace) as master:
+    fun = trace_to_subjaxpr(fun, master, True)
+    in_pvals = [PartialVal.unknown(aval) for aval in in_avals]
+    jaxpr, (out_pvals, consts, env) = fun.call_wrapped(in_pvals)
+    assert not env
+    del master
+  out_avals, out_consts = unzip2(out_pvals)
+  assert all(isinstance(aval, AbstractValue) for aval in out_avals)
+  del out_consts
+  return jaxpr, out_avals, consts
+
+def maybe_extend_axis_env(axis_name, axis_size):
+  assert not config.read("jax_omnistaging")
+  return (core.extend_axis_env(axis_name, axis_size) if axis_size is not None
+          else contextlib.suppress())

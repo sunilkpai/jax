@@ -204,14 +204,13 @@ class APITest(jtu.JaxTestCase):
       lambda: grad(f)(np.zeros(3), np.zeros(4)))
 
   def test_abstract_error_message(self):
-    raise unittest.SkipTest("broken by omnistaging")  # TODO(mattjj): DO NOT SUBMIT until revised
     for castfun in [float, complex, int]:
       def f(x):
         return castfun(x)
 
       self.assertRaisesRegex(
           TypeError,
-          f"Try using `x.astype\\({castfun.__name__}\\)` instead.",
+          f"[Tt]ry using `x.astype\\({castfun.__name__}\\)` instead.",
           lambda: jit(f)(1.0))
 
   def test_switch_value_jit(self):
@@ -224,9 +223,8 @@ class APITest(jtu.JaxTestCase):
 
     assert grad(f)(1.0) == 1.0
     assert grad(f)(-1.0) == -1.0
-    raise unittest.SkipTest("broken by omnistaging")  # TODO(mattjj): DO NOT SUBMIT until revised
     with self.assertRaisesRegex(core.ConcretizationTypeError,
-                                "Abstract tracer value encountered where concrete value is expected"):
+                                "Abstract tracer value"):
       jit(f)(1)
 
   def test_range_err(self):
@@ -238,17 +236,16 @@ class APITest(jtu.JaxTestCase):
     assert jit(f, static_argnums=(1,))(0, 5) == 10
     self.assertRaisesRegex(
         TypeError,
-        "('JaxprTracer2' object cannot be interpreted as an integer"
+        "('JaxprTracer2?' object cannot be interpreted as an integer"
         "|Abstract value passed to .*)",
         lambda: jit(f)(0, 5))
 
   def test_casts(self):
-    raise unittest.SkipTest("broken by omnistaging")  # TODO(mattjj): DO NOT SUBMIT until revised
     for castfun in [hex, oct, int]:
       f = lambda x: castfun(x)
       self.assertRaisesRegex(
           TypeError,
-          "('JaxprTracer2' object cannot be interpreted as an integer"
+          "('JaxprTracer2?' object cannot be interpreted as an integer"
           "|Abstract tracer value encountered where concrete value is expected .*)", lambda: jit(f)(0))
 
   def test_unimplemented_interpreter_rules(self):
@@ -951,26 +948,6 @@ class APITest(jtu.JaxTestCase):
       yield x
     self.assertRaisesRegex(TypeError, "Expected a function, got a generator function.*",
                            lambda: api.jit(gen))
-
-  def test_issue_1062(self):
-    # code from https://github.com/google/jax/issues/1062 @shoyer
-    # this tests, among other things, whether ShardedDeviceTuple constants work
-    device_count = xb.device_count()
-
-    @jit
-    def multi_step(state, count):
-      return lax.fori_loop(0, count, lambda i, s: s, state)
-
-    @jit
-    def multi_step_pmap(state, count=2):
-      @partial(api.pmap, axis_name='x')
-      def pmapped_multi_step(state):
-        return multi_step(state, count)
-
-      return pmapped_multi_step(state)
-
-    u = jnp.ones((device_count, 100))
-    _ = multi_step_pmap(u)  # doesn't crash
 
   def test_concurrent_device_get_and_put(self):
     def f(x):

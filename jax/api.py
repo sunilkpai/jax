@@ -75,6 +75,10 @@ FLAGS = flags.FLAGS
 flags.DEFINE_bool("jax_disable_jit",
                   bool_env("JAX_DISABLE_JIT", False),
                   "Disable JIT compilation and just call original Python.")
+flags.DEFINE_bool('jax_omnistaging',
+                  bool_env('JAX_OMNISTAGING', False),
+                  'Stage out all jax.numpy calls, not just by data dependence.')
+
 
 
 def _check_callable(fun):
@@ -1989,59 +1993,3 @@ def invertible(fun: Callable, concrete: bool = False) -> Callable:
                                    concrete=concrete)
     return tree_unflatten(out_tree(), out_flat)
   return fun_invertible
-
-
-# TODO(mattjj): remove backward compatibility shim for pre-omnistaging uses
-
-def deprecated_jit(fun: Callable, static_argnums: Iterable[int] = ()) -> Callable:
-  """Deprecated version of ``jit`` for backward compatibility.
-
-  Args:
-    fun: Function to be jitted. Should be a pure function, as side-effects may
-      only be executed once. Its arguments and return value should be arrays,
-      scalars, or (nested) standard Python containers (tuple/list/dict) thereof.
-    static_argnums: An int or collection of ints specifying which positional
-      arguments to treat as static (compile-time constant). Operations that only
-      depend on static arguments will be constant-folded in Python (during
-      tracing), and so the corrersponding argument values can be any Python
-      object. Calling the jitted function with different values for these
-      constants will trigger recompilation. If the jitted function is called
-      with fewer positional arguments than indicated by ``static_argnums`` then
-      an error is raised. Arguments that are not arrays or containers thereof
-      must be marked as static. Defaults to ().
-
-  Returns:
-    A wrapped version of ``fun``, set up for just-in-time compilation.
-  """
-  _check_callable(fun)
-  static_argnums = _ensure_tuple(static_argnums)
-
-  @cache()
-  def trace_to_jaxpr(f, in_tree, in_avals):
-    flat_fun, out_tree = flatten_fun(f, in_tree)
-    in_pvals = [pe.PartialVal.unknown(aval) for aval in in_avals]
-    jaxpr, _, consts = pe.trace_to_jaxpr(flat_fun, in_pvals, instantiate=True)
-    return pe.convert_constvars_jaxpr(jaxpr), consts, out_tree()
-
-  @wraps(fun)
-  def f_jitted(*args, **kwargs):
-    f = lu.wrap_init(fun)
-    if static_argnums:
-      dyn_argnums = [i for i in range(len(args)) if i not in static_argnums]
-      f, dyn_args = argnums_partial(f, dyn_argnums, args)
-    else:
-      dyn_args = args
-    args_flat, in_tree = tree_flatten((dyn_args, kwargs))
-    for arg in args_flat: _check_arg(arg)
-
-    # We simulate behavior of the old `jit` by running a partial eval pass.
-    in_avals = tuple(raise_to_shaped(core.get_aval(x)) for x in args_flat)
-    jaxpr, consts, out_tree = trace_to_jaxpr(f, in_tree, in_avals)
-    flat_fun = lu.hashable_partial(lu.wrap_init(core.eval_jaxpr), jaxpr, ())
-
-    donated_invars = (False,) * (len(consts) + len(args_flat))
-    out = xla.xla_call(flat_fun, *consts, *args_flat, device=None, backend=None,
-                       name=flat_fun.__name__, donated_invars=donated_invars)
-    return tree_unflatten(out_tree, out)
-
-  return f_jitted

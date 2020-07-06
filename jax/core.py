@@ -116,11 +116,6 @@ class TypedJaxpr:
     assert len(literals) == len(jaxpr.constvars)
     assert len(in_avals) == len(jaxpr.invars)
 
-    # TODO TODO remove this
-    for l in literals:
-      try: print(l._progenitor_messages())
-      except: pass
-
     assert not any(isinstance(l, Tracer) for l in literals), literals
 
     if not skip_checks:
@@ -637,17 +632,20 @@ class TraceState(threading.local):
   trace_stack: TraceStack
   substack: List[Sublevel]
   axis_env: List[AxisEnvFrame]
+  initial_style_staging: bool  # TODO(mattjj): remove when omnistaging-only
 
   def __init__(self) -> None:
     self.trace_stack = TraceStack()
     self.substack = [Sublevel(0)]
     self.axis_env = []
+    self.initial_style_staging = False
 
   def copy(self):
     new = TraceState()
     new.trace_stack = self.trace_stack.copy()
     new.substack = self.substack[:]
     new.axis_env = self.axis_env[:]
+    new.initial_style_staging = self.initial_style_staging
     return new
 trace_state = TraceState()
 
@@ -655,21 +653,13 @@ def reset_trace_state() -> bool:
   "Reset the global trace state and return True if it was already clean."
   if (trace_state.substack != [Sublevel(0)] or
       trace_state.axis_env != [] or
+      trace_state.initial_style_staging or
       trace_state.trace_stack.stack != [MasterTrace(0, EvalTrace)] or
       trace_state.trace_stack.dynamic != MasterTrace(0, EvalTrace)):
     trace_state.__init__()  # type: ignore
     return False
   else:
     return True
-
-@contextmanager
-def fresh_trace_state() -> Generator[None, None, None]:
-  global trace_state
-  trace_state, prev_state = TraceState(), trace_state
-  try:
-    yield
-  finally:
-    trace_state = prev_state
 
 def cur_sublevel() -> Sublevel:
   return trace_state.substack[-1]
@@ -709,6 +699,21 @@ def new_base_master(trace_type: Type[Trace]) -> Generator[MasterTrace, None, Non
   finally:
     stack.dynamic = prev_dynamic
     stack.stack[0] = prev_base
+
+@contextmanager
+def eval_context() -> Generator[None, None, None]:
+  with new_base_master(EvalTrace):
+    yield
+
+# TODO(mattjj): remove this when omnistaging-only
+@contextmanager
+def initial_style_staging() -> Generator[None, None, None]:
+  prev, trace_state.initial_style_staging = trace_state.initial_style_staging, True
+  try:
+    yield
+  finally:
+    trace_state.initial_style_staging = prev
+
 
 @contextmanager
 def new_sublevel() -> Generator[None, None, None]:
@@ -1284,8 +1289,7 @@ def check_jaxpr(jaxpr: Jaxpr):
   Raises `TypeError` if `jaxpr` is determined invalid. Returns `None` otherwise.
   """
   try:
-    with fresh_trace_state():
-      _check_jaxpr(jaxpr, [v.aval for v in jaxpr.invars])
+    _check_jaxpr(jaxpr, [v.aval for v in jaxpr.invars])
   except JaxprTypeError as e:
     if len(e.args) == 2:
       msg, eqn_idx = e.args
